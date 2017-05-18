@@ -1,0 +1,12 @@
+#user running this script must be in docker group
+#parameters:
+# - playbook: playbook to play
+# - test_cluster_name: name of he cluster of containers
+
+- include: "{{ playbook }}"
+  vars: {
+     ansible_host: "{{ test_cluster_name }}_{{ inventory_hostname }}",
+     ansible_connection: "docker",
+     ansible_user: "root"
+    }
+

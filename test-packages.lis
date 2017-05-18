@@ -1,0 +1,5 @@
+policycoreutils libselinux-utils libselinux-python
+openssh nc lsof libcgroup MySQL-python
+#python-httplib2 jq htop iftop sysdig
+yum-utils screen jna telnet curl
+gcc postfix

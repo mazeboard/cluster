@@ -1,0 +1,31 @@
+#!/bin/bash
+usage() {
+  echo USAGE
+  echo "> test-playbook test_cluster_name playbook [--debug] <ansible-playbook parameters>"
+  exit 1 
+}
+
+cluster=$1
+shift
+playbook=$1
+shift
+
+debug=0
+if [[ "$1" == "--debug" ]]; then
+  debug=1
+  shift
+fi
+
+[[ -z "$cluster" ]] && usage
+[[ -z "$playbook" ]] && usage
+
+# in order to keep the double-quotes (ie. --limit "")
+C=''
+for i in "$@"; do 
+    i="${i//\\/\\\\}"
+    C="$C \"${i//\"/\\\"}\""
+done
+
+[[ $debug -eq 1 ]] && set -x
+bash -c "ansible-playbook ../playbooks/test.yml $C -e \"playbook=$playbook test_cluster_name=$cluster\""
+[[ $debug -eq 1 ]] && set +x

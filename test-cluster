@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# create image and containers (one container per host in the inventory) for the test
+
+[[ -z "$TESTLOG" ]] && TESTLOG=/var/log/test.log
+
+usage() {
+  echo $1
+  echo
+  echo USAGE
+  echo ""
+  echo "> ./test-cluster create cluster-name [OPTIONS] [yum-package*]"
+  echo "OPTIONS:"
+  echo "  -b|--base-image base-image" 
+  echo "  -i|--inventory inventory" 
+  echo "  -l|--limit limit" 
+  echo "  -r|--roles roles"
+  echo "  -p|--playbook playbook"
+  echo "  -t|--tag tag-image"    # tag of the created cluster image
+  echo "  -e|--privileged hosts" # hosts is a pattern as in --limit or in >ansible pattern ...
+  echo "  -u|--unprivileged hosts" 
+  echo "  -k|--test-packages file"
+  echo "  -v|--verbose"
+  echo "  -d|--debug"
+  echo ""
+  echo "if base image is not provided then the previously created cluster image is used as a base image"
+  echo "if it exists, otherwise the base image must be provided."
+  echo ""
+  echo "Remove cluster"
+  echo "> ./test-cluster remove cluster-name"
+  echo ""
+  echo "Commit cluster"
+  echo "> ./test-cluster commit cluster-name"
+  echo ""
+  echo "Create a test cluster from an existing cluster"
+  echo "> ./test-cluster create cluster-name -f|--from-commited-cluster"
+  echo ""
+  echo "Run playbook on test cluster"
+  echo "> ./test-cluster run cluster-name playbook [ansible-playbook arguments]"
+  echo ""
+  exit 1
+}
+error() {
+  log $1
+  exit 1
+}
+log() {
+  echo; echo "- $@"
+}
+install() {
+  c=$1
+  shift
+  while [[ ! -z "$@" ]];
+  do
+    log "Installing package $1"
+    docker exec -u root -i $c /bin/sh -c "yum install -y $1"
+    shift
+  done
+}
+
+getargs() {
+  opt=0
+  if [[ "$1" == "-b" || "$1" == "-base-image" ]]; then
+    shift
+    base_image=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-d" || "$1" == "--debug" ]]; then
+    shift
+    DEBUG=1
+    opt=1
+  elif [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
+    shift
+    verbose="-vvv"
+    opt=1
+  elif [[ "$1" == "-i" || "$1" == "--inventory" ]]; then
+    shift
+    inventory=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-k" || "$1" == "--test-packages" ]]; then
+    shift
+    test_packages=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-l" || "$1" == "--limit" ]]; then
+    shift
+    limit=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-t" || "$1" == "--tag" ]]; then
+    shift
+    tag=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-r" || "$1" == "--roles" ]]; then
+    shift
+    roles=`echo $1|tr "," " "`
+    shift
+    opt=1
+  elif [[ "$1" == "-p" || "$1" == "--playbook" ]]; then
+    shift
+    playbook=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-e" || "$1" == "--privileged" ]]; then
+    shift
+    privileged=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-u" || "$1" == "--unprivileged" ]]; then
+    shift
+    unprivileged=$1
+    shift
+    opt=1
+  elif [[ "$1" == "-f" || "$1" == "--from-commited-cluster" ]]; then
+    shift
+    from_cluster=$1
+    shift
+    opt=1
+  elif [[ ! -z "$1" && "$1" == "`echo $1|grep '^\-'`" ]]; then
+    usage
+  fi
+  if [[ "$opt" -eq 1 ]]; then
+    getargs $@
+  else
+    rest=$@
+  fi
+}
+ 
+getpackages() {
+  packages=""
+  [[ ! -z "$test_packages" ]] && packages=`cat $test_packages|awk -F"#" '{print $1}'`
+  while [[ ! -z "$1" ]];
+  do
+    grep $1 $packages 
+    [[ ! $? -eq 0 ]] && packages="$packages $1"
+    shift
+  done
+  echo $packages
+}
+
+confirm() {
+  repl=""
+  while [[ "$repl" != "y" && "$repl" != "Y" ]];
+  do
+    log "$1 [yn]? "
+    read repl
+    [[ "$repl" == "N" || "$repl" == "n" ]] && exit 0
+  done
+}
+
+remove_cluster() {
+  c=`echo "$@"|grep network`
+  if [[ $cluster_network_exists -eq 0 && $? -eq 0 ]]; then
+     containers=`docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' $cluster`
+     for container in $containers
+     do
+       docker inspect --type image $container 2>&1 >/dev/null
+       if [[ $? -eq 0 ]]; then
+          # commited cluster
+          log "remove image of the commited cluster container $container"
+          docker rmi $container #2>&1 >/dev/null
+          [[ ! $? -eq 0 ]] && error "cannot remove commited cluster; must remove all clusters using the cluster $cluster"
+       fi
+       log "remove container $container"
+       docker rm -f $container
+     done
+     log "remove cluster network $cluster_network"
+     docker network rm $cluster_network 
+     [[ ! $? -eq 0 ]] && error "failed to remove cluster network $cluster id=$cluster_network"
+  fi
+  c=`echo "$@"|grep container`
+  if [[ $cluster_container_exists -eq 0 && $? -eq 0 ]]; then
+     log "remove cluster initial container $cluster_container"
+     docker rm -f $cluster_container
+     [[ ! $? -eq 0 ]] && error "failed to remove cluster container ${cluster}_localhost id=$cluster_container"
+  fi
+  c=`echo "$@"|grep image`
+  if [[ $cluster_image_exists -eq 0 && $? -eq 0 ]]; then
+     log "remove cluster image $cluster_image"
+     docker rmi $cluster_image
+    [[ ! $? -eq 0 ]] && error "failed to remove cluster image $cluster id=$cluster_image"
+  fi
+}
+
+create_image() {
+# globals: cluster, packages, roles, playbook, inventory, limit, verbose, tag
+# parameters: base_image cluster_container
+
+  container=$cluster_container
+  if [[ -z "$container" ]]; then
+     log "Creating the initial container of the cluster $cluster"
+     container=`docker run --name "${cluster}_localhost" $test_env \
+        -itd $base_image /bin/bash`
+  else
+    x=`docker inspect --format "{{.State.Status}}" $container`
+    if [[ ! "$x" == "running" ]]; then
+      docker start $container
+      [[ ! $? -eq 0 ]] && error "failed to start cluster container $container"
+    fi
+    log "Using the already existing inital container of the cluster $cluster"
+  fi
+  log "Installing packages on the initial container of the cluster $cluster"
+  log "$packages"
+  [[ ! -z "$packages" ]] && install $container $packages
+
+  if [[ ! -z "$roles" ]]; then
+    tmp=../playbooks/.$$_`date +"%Y%m%d%H%M%S"`
+    cat <<! > $tmp
+- hosts: "all"
+  vars_files:
+        - secrets/{{site}}-secrets.yml
+  roles:
+!
+    for r in $roles
+    do
+      echo "    - {role: $r}" >> $tmp
+    done
+    log "Playing the roles $roles"
+    ansible-playbook $tmp -i $inventory -l "all[0]" -c docker -u root -e "ansible_host=${cluster}_localhost" $verbose
+    [[ ! $? -eq 0 ]] && rm -f $tmp && error "failed to play roles $roles"
+    rm -f $tmp
+  fi
+
+  if [[ ! -z "$playbook" ]]; then
+    log "Playing the playbook $playbook"
+    ansible-playbook $playbook -i $inventory -l "all[0]" -c docker -u root -e "ansible_host=${cluster}_localhost" $verbose 
+    [[ ! $? -eq 0 ]] && rm -f $tmp && error "failed to play playbook $playbook"
+    rm -f $tmp
+  fi
+  log "Commiting the image of the cluster $cluster"
+  docker commit -m "test" -a "test-cluster" $container $cluster
+  docker rm -f $container # delete container, so it is possible to recreate the cluster using as base image the cluster image
+  if [[ ! -z "$tag" ]]; then
+    # the newly tagged image can be used as base image for othe test clusters
+    log "tag cluster image as $tag"
+    docker tag $cluster $tag
+  fi
+}
+
+setPrivileged() {
+  [[ -z "$unprivileged" && -z "$privileged" ]] && unprivileged=all
+  if [[ ! -z "$privileged" ]]; then
+     tmp=`ansible $privileged -i $inventory -l "$limit" --list-hosts`
+     [[ ! $? -eq 0 ]] && error "error in obtaining list of privileged hosts (check log file)"
+    privileged=`echo $tmp|awk -F": " '{print $2}'`
+  else
+    privileged=""
+  fi
+  if [[ ! -z "$unprivileged" ]]; then
+    tmp=`ansible $unprivileged -i $inventory -l "$limit" --list-hosts`
+    [[ ! $? -eq 0 ]] && error "error in obtaining list of unprivileged hosts (check log file)"
+    unprivileged=`echo $tmp|awk -F": " '{print $2}'`
+  else
+    unprivileged=""
+  fi
+  # assert all == privileged union unprivileged
+  # assert privileged intersect unprivileged == ""
+  x=`echo $privileged|awk '{print NF}'`
+  y=`echo $unprivileged|awk '{print NF}'`
+  z=`echo $all|awk '{print NF}'`
+  if [[ $x -eq 0 && $y -lt $z ]]; then
+     #privileged=all minus $unprivileged
+     privileged=""
+     for h in $all
+     do
+        [[ -z `echo $unprivileged|grep $h` ]] && privileged="$privileged $h"
+     done
+     x=`echo $privileged|awk '{print NF}'`
+  fi
+  # if unprivileged is empty then all hosts not in privileged are considered unprivileged
+  if [[ ! $(($x+$y)) -eq $z && $y -gt 0 ]]; then
+     echo "privileged hosts: $privileged"
+     echo "unprivileged hosts: $unprivileged"
+     error "the sets privileged and unprivileged hosts must be distinct"
+  fi
+}
+
+allhosts() {
+  if [[ ! -z "$from_cluster" ]]; then
+     [[ ! -z "$inventory" ]] && usage "inventory is not allowed; hosts in cluster $from_cluster will be used"
+     images=`docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' $from_cluster`
+     all="" 
+     _all="" 
+     for image in $images
+     do
+       host=`echo $image|awk -F"_" '{print $2}'`
+       _all="$host $_all"
+       docker inspect --type image $image 2>&1 > /dev/null
+       [[ ! $? -eq 0 ]] && error "container $container of cluster $from_cluster is not commited (commit cluster $from_cluster)"
+     done
+     inventory=".test-inventory"
+     echo "[all] $all"|tr " " "\n" > $inventory
+     if [[ ! -z "$limit" ]]; then
+        tmp=`ansible "$limit" -i $inventory --list-hosts`
+        [[ ! $? -eq 0 ]] && error "error in obtaining list of limit hosts (check log file)"
+        limithosts=`echo $tmp|awk -F": " '{print $2}'`
+        for hosts in $_all
+        do
+           echo "$limithosts"|grep $host
+           [[ ! $? -eq 0 ]] && all="$all $host" 
+        done
+     fi
+  else
+     [[ -z "$inventory" ]] && usage "missing inventory"
+     tmp=`ansible all -i $inventory -l "$limit" --list-hosts`
+     [[ ! $? -eq 0 ]] && error "error in obtaining list of all hosts (check log file)"
+     all=`echo $tmp|awk -F": " '{print $2}'`
+  fi
+}
+
+create_from_cluster() {
+  log "create cluster $cluster from cluster $from_cluster"
+
+  log "Create the network of the cluster $cluster"
+  docker network create $cluster
+
+  log "Create containers for the cluster $cluster"
+  images=`docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' $from_cluster`
+  for image in $images
+  do
+     host=`echo $image|awk -F"_" '{print $2}'`
+     echo "$all"|grep $host
+     if [[ $? -eq 0 ]]; then
+        docker inspect --type image $image 2>&1 > /dev/null
+        [[ ! $? -eq 0 ]] && error "container $container of cluster $from_cluster is not commited (commit cluster $from_cluster)"
+        log "Creating container ${cluster}_$host from image $image"
+        echo $privileged|grep $host
+        docker run -itd --name=${cluster}_$host --net=$cluster `[[ $? -eq 0 ]] && echo "--privileged"` $test_env $image /bin/bash
+     fi
+  done
+
+  log "link containers"
+  ips=`docker network inspect --format='{{range .Containers}}{{.IPv4Address}} {{.Name}}\n{{end}}' $cluster` 
+  ips=`echo "$ips"|sed 's/ test_/ /g'` 
+  for host in $all
+  do
+    docker exec -u root -i ${cluster}_$host /bin/sh -c "echo -e \"$ips\" >> /etc/hosts"
+  done
+ }
+
+create_cluster() {
+  log "Create cluster $cluster"
+
+  x=`docker inspect --type image $base_image`
+  [[ $? -ne 0 ]] && error "base image $base_image does not exist"
+
+  log "Create the network of the cluster $cluster"
+  [[ ! $cluster_network_exists -eq 0 ]] && docker network create $cluster
+
+  log "Create the image of the cluster $cluster"
+  create_image
+
+  log "Create containers for the cluster $cluster"
+  for host in $all
+  do
+    log "Creating container ${cluster}_$host"
+    echo $privileged|grep $host
+    docker run -itd --name=${cluster}_$host --net=$cluster `[[ $? -eq 0 ]] && echo "--privileged"` $test_env $cluster /bin/bash
+  done
+  log "link containers"
+  ips=`docker network inspect --format='{{range .Containers}}{{.IPv4Address}} {{.Name}}\n{{end}}' $cluster` 
+  ips=`echo "$ips"|sed 's/ test_/ /g'` 
+  for host in $all
+  do
+    docker exec -u root -i ${cluster}_$host /bin/sh -c "echo -e \"$ips\" >> /etc/hosts"
+  done
+}
+
+commit_cluster() {
+  log "Commit cluster $cluster"
+  containers=`docker network inspect --format='{{range .Containers}}{{.Name}} {{end}}' $cluster`
+  for container in $containers
+  do
+     log "Creating image $container from container $container"
+     docker commit -m "commited test cluster $cluster" -a "test-cluster" $container $container
+  done
+}
+
+main() {
+  case "$action" in
+  create)
+     getargs $@
+     [[ ! -z "$DEBUG" ]] && set -x
+
+     [[ ! -z "$test_packages" && ! -e $test_packages ]] && error "file $test_packages does not exist"
+
+     [[ $cluster_container_exists -eq 0 ]] && log "cluster initial container ${cluster}_localhosts exists"
+     [[ $cluster_image_exists -eq 0 && ! -z "$from_cluster" ]] && log "cluster image $cluster exists"
+     [[ $cluster_image_exists -eq 0 && -z "$from_cluster" && -z "$base_image" ]] && log "cluster image $cluster exists, it will be used as base image"
+     [[ $cluster_image_exists -eq 0 && -z "$from_cluster" && ! -z "$base_image" ]] && log "cluster image $cluster exists, it will be removed"
+     [[ $cluster_network_exists -eq 0 ]] && log "cluster network $cluster exists"
+
+     allhosts
+
+     setPrivileged
+
+     packages=`getpackages $rest`
+
+     if [[ -z "$from_cluster" ]]; then
+        if [[ $cluster_container_exists -eq 0 || $cluster_image_exists -eq 0 || $cluster_network_exists -eq 0 ]]; then
+           confirm "reuse initial container if it exists. continue"
+           if [[ -z "$base_image" ]]; then
+              remove_cluster network
+           else
+              remove_cluster image network
+           fi
+        fi
+        if [[ -z "$base_image" ]]; then
+           if [[ $cluster_image_exists -eq 0 ]]; then
+              base_image=$cluster_image
+           else
+              usage "no base image specified"
+           fi
+         fi
+         create_cluster
+     else
+        docker network inspect --format="{{.ID}}" ${from_cluster} # bug? use ID instead of Id
+        [[ ! $? -eq 0 ]] && error "from cluster ${from_cluster} does not exist"
+
+        if [[ $cluster_container_exists -eq 0 || $cluster_image_exists -eq 0 || $cluster_network_exists -eq 0 ]]; then
+           confirm "continue"
+           remove_cluster container image network
+        fi
+        create_from_cluster
+     fi
+     [[ ! -z "$DEBUG" ]] && set +x
+     ;;
+  commit)
+     [[ ! -z "$@" ]] && usage
+     commit_cluster
+     ;;
+  remove)
+     [[ ! -z "$@" ]] && usage
+     remove_cluster image container network
+     ;;
+  run)
+     playbook=$1
+     shift
+     [[ -z "$playbook" ]] && usage
+     ansible-playbook ../playbooks/test.yml $@ -e "playbook=$playbook test_cluster_name=$cluster"
+     ;;
+  *) error "invalid command"
+     ;;
+  esac
+}
+
+action=$1
+[[ -z "$action" ]] && usage
+shift
+cluster=$1
+[[ -z "$cluster" ]] && usage
+shift
+
+#to be able to run service
+#docker run --privileged  -ti -e "container=docker"  -v /sys/fs/cgroup:/sys/fs/cgroup  centos  /usr/sbin/init
+
+test_env="--env=http_proxy=http://10.245.42.1:8080 \
+        --env=https_proxy=https://10.245.42.1:8080 \
+        --env=\"no_proxy=phenix-repository.edc.carrefour.com,udd-phenix.edc.carrefour.com,localhost,127.0.0.1\""
+
+cluster_container=`docker inspect --type container --format="{{.Id}}" ${cluster}_localhost 2>/dev/null`
+cluster_container_exists=$?
+cluster_image=`docker inspect --type image --format="{{.Id}}" ${cluster} 2>/dev/null`
+cluster_image_exists=$?
+cluster_network=`docker network inspect --format="{{.ID}}" ${cluster} 2>/dev/null` # bug? use ID instead of Id
+cluster_network_exists=$?
+
+rest=""
+
+main $@ | tee .test-cluster.log #|grep -E --line-buffered "^\+ "
